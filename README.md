@@ -74,7 +74,7 @@ Add to `~/.claude.json` under `mcpServers` (adjust paths to your install):
 }
 ```
 
-Restart Claude Code. The `generate_video` and `meta_browser_status` tools will appear.
+Restart Claude Code. The `generate_video`, `generate_image`, and `meta_browser_status` tools will appear.
 
 ## Usage
 
@@ -89,8 +89,24 @@ venv/Scripts/python meta_video.py "animate this, keep characters consistent" ima
 
 ```
 generate_video(prompt, image_path="", out_path="", timeout=300)  → {success, out_path, video_url, bytes}
+generate_image(prompt, out_path="", timeout=180)                 → {success, out_path, bytes}
 meta_browser_status()                                             → {cdp_alive, port, hint}
 ```
+
+### Images (free)
+
+Meta's reverse-engineered HTTP image API is schema-stale, so `generate_image` drives the same
+logged-in `meta.ai/create` browser, waits for the generated image on Meta's AI image CDN
+(`t39.105495`), and downloads it **in-page** (fetch → dataURL — no cookie/auth dance):
+
+```python
+from meta_image import generate_image
+generate_image("a photorealistic Jamaican yard, banana trees, board house, no text", "yard.jpg")
+```
+
+> Free image gen is great for scenery/B-roll but can be **loose on specifics** (it renders "generic
+> banknotes" when asked for a particular currency). If accuracy matters, judge the result with a
+> vision model and fall back to a paid generator — don't assume the first image is right.
 
 ### Chained video (beat the 5.2s cap)
 
@@ -107,8 +123,9 @@ Styles: `cinematic`, `anime`, `claymation`, `pixar`, `comic`, `realistic`, `flat
 
 | File | Purpose |
 |---|---|
-| `meta_video.py` | Core driver — `MetaVibes` class, text/image→video, chained video |
-| `mcp_server.py` | FastMCP server exposing `generate_video` + `meta_browser_status` |
+| `meta_video.py` | Core driver — `MetaVibes` class, text/image→video, chained video, account rotation |
+| `meta_image.py` | Free image gen via the browser (reliable capture from Meta's AI image CDN) |
+| `mcp_server.py` | FastMCP server exposing `generate_video` + `generate_image` + `meta_browser_status` |
 | `launch_meta_browser.py` | Start Chrome on CDP port + inject cookies (idempotent) |
 | `save_cookies.py` | Export live cookies from running browser to `cookies.json` |
 | `research/` | Reverse-engineering capture scripts (kept for reference) |

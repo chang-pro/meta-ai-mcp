@@ -1,9 +1,26 @@
 venv/
 cookies.json
+cookies*.bak*
+*.bak_*
+accounts/
 *.jsonl
 __pycache__/
 *.pyc
 *.mp4
 *.png
+*.jpg
+*.log
+image_test/
+meta_images/
 _chain_work/
 .env
+# stray readme/profile scripts from other projects (not part of this MCP)
+add_licenses.py
+add_nobacktestdrift_readme.py
+clean_readme_deleted.py
+fix_readme_ringora.py
+remove_dental_readme.py
+remove_readme_entries.py
+update_profile_readme.py
+inject_reload.py
+capture*.jsonl

@@ -28,8 +28,32 @@ ABW_JS = os.environ.get(
     os.path.join(os.environ.get("APPDATA", ""), "npm", "node_modules",
                  "agent-browser", "bin", "agent-browser.js"))
 
+# --- Accounts for rotation ---------------------------------------------------
+# Account = a set of meta.ai cookies (datr + session). The active account is the
+# one in cookies.json / the Chrome profile. Extra accounts are cookie JSON files
+# dropped in accounts/ (e.g. accounts/acct2.json). Rotation clears cookies, sets
+# the next account's, and reloads — cycling back to the first when it runs out.
+ACCOUNTS_DIR = os.environ.get("META_ACCOUNTS_DIR", os.path.join(os.path.dirname(__file__), "accounts"))
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.json")
+
+
+def _discover_accounts():
+    accts = []
+    if os.path.isdir(ACCOUNTS_DIR):
+        for fn in sorted(os.listdir(ACCOUNTS_DIR)):
+            if fn.lower().endswith(".json"):
+                accts.append(os.path.join(ACCOUNTS_DIR, fn))
+    if os.path.exists(COOKIES_FILE) and COOKIES_FILE not in accts:
+        accts.insert(0, COOKIES_FILE)   # active account first
+    return accts
+
 
 class MetaError(Exception):
+    pass
+
+
+class MetaAccountCapped(MetaError):
+    """Raised when an account looks capped (generations keep timing out) and rotation is needed."""
     pass
 
 
@@ -60,6 +84,8 @@ class MetaVibes:
         self.port = port
         # ensure agent-browser is attached to the running logged-in Chrome
         self._abw("connect", str(port))
+        self.accounts = _discover_accounts()   # cookie files; [0] is the active account
+        self.acct_idx = 0
 
     # ---- agent-browser plumbing ----
     def _abw(self, *args, timeout=60):
@@ -90,12 +116,61 @@ class MetaVibes:
         has = self._eval("!!document.querySelector('textarea')")
         if has in (True, "true"):
             return
-        self._abw("open", "https://www.meta.ai/create")
+        self._abw("open", "https://www.meta.ai/vibes")
         for _ in range(20):
             if self._eval("!!document.querySelector('textarea')") in (True, "true"):
                 return
             time.sleep(1)
         raise MetaError("composer textarea never appeared")
+
+    def new_chat(self):
+        """Start a FRESH Meta AI conversation (a new chat). Used when the current chat stalls —
+        a hung generation leaves the textarea present, so ensure_composer() alone won't reset it."""
+        self._abw("open", "https://www.meta.ai/vibes")
+        time.sleep(2)
+        for _ in range(20):
+            if self._eval("!!document.querySelector('textarea')") in (True, "true"):
+                return
+            time.sleep(1)
+        raise MetaError("composer textarea never appeared after new_chat")
+
+    def _cdp_cookie_ops(self, ops):
+        """Run a batch of CDP Network.* ops against the browser-level endpoint (for account cookie swaps)."""
+        import websocket
+        with urllib.request.urlopen(f"http://localhost:{self.port}/json/version", timeout=5) as r:
+            ws_url = json.load(r)["webSocketDebuggerUrl"]
+        ws = websocket.create_connection(ws_url, suppress_origin=True)
+        mid = 0
+        def send(method, params):
+            nonlocal mid
+            mid += 1
+            ws.send(json.dumps({"id": mid, "method": method, "params": params}))
+            while True:
+                m = json.loads(ws.recv())
+                if m.get("id") == mid:
+                    return m
+        try:
+            for method, params in ops:
+                send(method, params)
+        finally:
+            ws.close()
+
+    def rotate_account(self):
+        """Switch to the NEXT Meta account: clear cookies, inject the next account's cookies, reload.
+        Cycles back to the first account after the last. Raises if there is only one account."""
+        if len(self.accounts) <= 1:
+            raise MetaError("no alternate Meta account to rotate to — add cookie JSON files under accounts/")
+        self.acct_idx = (self.acct_idx + 1) % len(self.accounts)
+        path = self.accounts[self.acct_idx]
+        cookies = json.load(open(path))
+        ops = [("Network.clearBrowserCookies", {})]
+        for name, value in cookies.items():
+            ops.append(("Network.setCookie", {"name": name, "value": value, "domain": ".meta.ai", "path": "/"}))
+        self._cdp_cookie_ops(ops)
+        self._abw("open", "https://www.meta.ai/vibes")
+        time.sleep(3)
+        self.ensure_composer()
+        return os.path.basename(path)
 
     def video_srcs(self):
         """Ordered list of video srcs in DOM order (topmost/newest first).
@@ -201,10 +276,8 @@ class MetaVibes:
         return out_path
 
     # ---- public ----
-    def generate_video(self, prompt, image_path=None, out_path=None, timeout=300):
-        if out_path is None:
-            safe = "".join(c for c in prompt[:40] if c.isalnum() or c in " -_").strip().replace(" ", "-")
-            out_path = os.path.join(DEFAULT_OUT_DIR, f"{safe or 'clip'}.mp4")
+    def _generate_once(self, prompt, image_path, out_path, timeout):
+        """One generation in the CURRENT chat. Raises MetaError on stall/failure."""
         self.ensure_composer()
         before = self.video_srcs()
         if image_path:
@@ -215,6 +288,37 @@ class MetaVibes:
         size = os.path.getsize(out_path)
         return {"success": True, "out_path": out_path, "video_url": url,
                 "bytes": size, "prompt": prompt}
+
+    def generate_video(self, prompt, image_path=None, out_path=None, timeout=300,
+                       chat_retries=1, rotate_accounts=True):
+        """Resilient generate. Reuses ONE chat; on a stall opens a NEW chat and retries; if the whole
+        account keeps stalling it ROTATES to the next account (cycling back). Returns the usual result dict.
+
+        chat_retries: extra fresh-chat attempts per account after the first (1 => first chat + 1 new chat).
+        rotate_accounts: after chats are exhausted on an account, move to the next cookie account."""
+        if out_path is None:
+            safe = "".join(c for c in prompt[:40] if c.isalnum() or c in " -_").strip().replace(" ", "-")
+            out_path = os.path.join(DEFAULT_OUT_DIR, f"{safe or 'clip'}.mp4")
+        attempts_per_account = 1 + max(0, chat_retries)
+        accounts_to_try = max(1, len(self.accounts)) if rotate_accounts else 1
+        last_err = None
+        for a in range(accounts_to_try):
+            for c in range(attempts_per_account):
+                try:
+                    if c > 0:
+                        self.new_chat()        # current chat stalled -> next chat, same account
+                    return self._generate_once(prompt, image_path, out_path, timeout)
+                except MetaError as e:
+                    last_err = e
+            # every chat on this account stalled -> rotate to the next account (if any) and retry
+            if rotate_accounts and a < accounts_to_try - 1 and len(self.accounts) > 1:
+                try:
+                    who = self.rotate_account()
+                    last_err = MetaError(f"rotated to account {who} after stalls; {last_err}")
+                except MetaError as e:
+                    last_err = e
+                    break
+        return {"success": False, "error": f"MetaError: {last_err}"}
 
     # ---- multi-segment chaining (5s back-to-back -> continuous longer motion) + styles ----
     def _last_frame(self, video_path, out_png):
