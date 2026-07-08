@@ -1,0 +1,9 @@
+venv/
+cookies.json
+*.jsonl
+__pycache__/
+*.pyc
+*.mp4
+*.png
+_chain_work/
+.env
