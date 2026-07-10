@@ -13,24 +13,28 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 META_CHAT_URL = "https://www.meta.ai/"
 
-# Selectors for the meta.ai chat composer (as of 2026)
+# Selectors for the meta.ai chat composer (as of 2026). textarea FIRST: meta.ai's
+# real composer is a 0x0 auto-grow <textarea> (offsetParent null, rect 0x0) that
+# React reads — a visibility filter would reject the only working input on the page.
 _INPUT_SELECTORS = [
+    "textarea",
     "div[contenteditable='true']",
     "div[contenteditable]",
-    "textarea",
+    "[role=textbox]",
 ]
 _SEND_ARIA = ["Send message", "Send"]
 
 
 def _find_input_js():
-    """JS that returns the first visible composer input or null."""
+    """JS that returns the first selector with a present, enabled composer input, or null.
+
+    Deliberately NO visibility check — see _INPUT_SELECTORS note."""
     sel_json = json.dumps(_INPUT_SELECTORS)
     return f"""(()=>{{
         const sels={sel_json};
         for(const s of sels){{
-            const els=[...document.querySelectorAll(s)];
-            const vis=els.find(e=>e.offsetParent!==null&&!e.disabled);
-            if(vis) return s;
+            const els=[...document.querySelectorAll(s)].filter(e=>!e.disabled);
+            if(els.length) return s;
         }}
         return null;
     }})()"""
@@ -66,23 +70,23 @@ def _fill_input_js(prompt_json, selector_json):
 
 
 def _click_send_js(send_labels_json):
-    """JS that clicks the first visible enabled Send button."""
+    """JS that clicks the Send button by aria-label, force-enabling it first.
+
+    No visibility check and disabled is overridden — same proven pattern as
+    meta_video.submit (React sometimes leaves the button disabled until its
+    own event loop catches up, but a click still submits)."""
     return f"""(()=>{{
         const labels={send_labels_json};
         const btns=[...document.querySelectorAll('button,[role=button]')];
         for(const lbl of labels){{
             const b=btns.find(b=>
-                (b.getAttribute('aria-label')||'').toLowerCase()===lbl.toLowerCase()&&
-                b.offsetParent!==null&&!b.disabled
-            );
-            if(b){{b.click();return 'clicked:'+lbl;}}
+                (b.getAttribute('aria-label')||'').toLowerCase()===lbl.toLowerCase());
+            if(b){{b.disabled=false;b.click();return 'clicked:'+lbl;}}
         }}
         // fallback: find any send-looking button
         const fallback=btns.find(b=>
-            /send|submit/i.test(b.getAttribute('aria-label')||b.title||b.textContent)&&
-            b.offsetParent!==null&&!b.disabled
-        );
-        if(fallback){{fallback.click();return 'clicked:fallback';}}
+            /send|submit/i.test(b.getAttribute('aria-label')||b.title||''));
+        if(fallback){{fallback.disabled=false;fallback.click();return 'clicked:fallback';}}
         return 'no_send';
     }})()"""
 
@@ -94,8 +98,10 @@ def _last_response_js():
     question), the text alone never changes — the count is how we detect the new reply."""
     return """(()=>{
         const pack=(n,t)=>JSON.stringify({n:n,t:(t||'').trim()});
-        // meta.ai wraps AI messages in [data-message-role="assistant"] or similar
-        const roles=['[data-message-role="assistant"]','[data-author="assistant"]',
+        // .ur-markdown = meta.ai's rendered AI reply container (verified live 2026-07-10;
+        // user bubbles do NOT match it). Role-based selectors kept as fallbacks.
+        const roles=['.ur-markdown',
+                     '[data-message-role="assistant"]','[data-author="assistant"]',
                      '[class*="assistant"],[class*="ai-message"],[class*="bot-message"]'];
         for(const sel of roles){
             const msgs=[...document.querySelectorAll(sel)];
@@ -183,17 +189,23 @@ class MetaChat:
         # text is identical to the previous one (same question asked twice)
         before_n, before_text = self._get_response()
 
-        # Fill the input
-        fill_result = self._g._eval(_fill_input_js(json.dumps(prompt), json.dumps(sel)))
-        if "no_input" in str(fill_result):
-            raise MetaError(f"Could not fill input (selector={sel})")
-
-        time.sleep(0.5)
-
-        # Click Send
-        click_result = self._g._eval(_click_send_js(json.dumps(_SEND_ARIA)))
-        if "no_send" in str(click_result):
-            raise MetaError("Send button not found or not clickable")
+        # Primary path: agent-browser fill + real Enter keypress. These are TRUSTED
+        # CDP input events — meta.ai's main-page composer ignores synthetic
+        # element.click() on its Send button (verified live 2026-07-10), but
+        # submits fine on a real Enter.
+        try:
+            self._g._abw("fill", sel, prompt, timeout=30)
+            time.sleep(0.5)
+            self._g._abw("press", "Enter", timeout=15)
+        except MetaError:
+            # Fallback: JS fill + Send-button click (works on the older /vibes composer)
+            fill_result = self._g._eval(_fill_input_js(json.dumps(prompt), json.dumps(sel)))
+            if "no_input" in str(fill_result):
+                raise MetaError(f"Could not fill input (selector={sel})")
+            time.sleep(0.5)
+            click_result = self._g._eval(_click_send_js(json.dumps(_SEND_ARIA)))
+            if "no_send" in str(click_result):
+                raise MetaError("Send button not found or not clickable")
 
         # Wait for new response to appear and finish streaming
         end = time.time() + timeout

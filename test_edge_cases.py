@@ -82,15 +82,19 @@ class JsInjectionTests(unittest.TestCase):
 
 
 class FakeChatG:
-    """Fake MetaVibes for MetaChat: dispatches _eval by JS content."""
+    """Fake MetaVibes for MetaChat: dispatches _eval by JS content.
+
+    By default _abw fill/press RAISES so tests exercise the JS fallback path;
+    set trusted_input=True to simulate the primary agent-browser path."""
 
     def __init__(self, url="https://www.meta.ai/", find_sel="div[contenteditable='true']",
-                 fill="filled:11", click="clicked:Send", streaming=False):
+                 fill="filled:11", click="clicked:Send", streaming=False, trusted_input=False):
         self.url = url
         self.find_sel = find_sel
         self.fill = fill
         self.click = click
         self.streaming = streaming
+        self.trusted_input = trusted_input
         self.responses = [(1, "old")]   # (count, text) returned before submit
         self.after = [(2, "new")]       # cycled through after Send is clicked
         self.sent = False
@@ -99,6 +103,11 @@ class FakeChatG:
 
     def _abw(self, *args, **kw):
         self.opened.append(args)
+        if args and args[0] in ("fill", "press"):
+            if not self.trusted_input:
+                raise MetaError("abw input unavailable in fake")
+            if args[0] == "press":
+                self.sent = True
         return ""
 
     def _eval(self, js, timeout=60):
@@ -130,6 +139,17 @@ class MetaChatTests(unittest.TestCase):
         g.after = [(2, "the answer")]
         out = meta_chat.MetaChat(g).ask("q", timeout=30)
         self.assertEqual(out, "the answer")
+
+    @NO_SLEEP
+    def test_trusted_input_path(self):
+        """Primary path: agent-browser fill + Enter, no JS fill/click needed."""
+        g = FakeChatG(trusted_input=True)
+        g.after = [(2, "trusted answer")]
+        out = meta_chat.MetaChat(g).ask("q", timeout=30)
+        self.assertEqual(out, "trusted answer")
+        cmds = [a[0] for a in g.opened]
+        self.assertIn("fill", cmds)
+        self.assertIn("press", cmds)
 
     @NO_SLEEP
     def test_same_answer_twice_detected_by_count(self):
