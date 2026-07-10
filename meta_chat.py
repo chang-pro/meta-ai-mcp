@@ -88,25 +88,30 @@ def _click_send_js(send_labels_json):
 
 
 def _last_response_js():
-    """JS that returns the text of the last AI response message bubble."""
+    """JS that returns JSON {n: message count, t: last AI response text}.
+
+    The count matters: if Meta gives the SAME answer twice in a row (or you re-ask a
+    question), the text alone never changes — the count is how we detect the new reply."""
     return """(()=>{
+        const pack=(n,t)=>JSON.stringify({n:n,t:(t||'').trim()});
         // meta.ai wraps AI messages in [data-message-role="assistant"] or similar
         const roles=['[data-message-role="assistant"]','[data-author="assistant"]',
                      '[class*="assistant"],[class*="ai-message"],[class*="bot-message"]'];
         for(const sel of roles){
             const msgs=[...document.querySelectorAll(sel)];
-            if(msgs.length){return msgs[msgs.length-1].innerText||'';}
+            if(msgs.length){return pack(msgs.length,msgs[msgs.length-1].innerText);}
         }
-        // fallback: grab all "response" paragraphs after the last user message
+        // fallback: grab all role-tagged messages
         const allMsgs=[...document.querySelectorAll('[data-message-role],[data-author]')];
         if(!allMsgs.length){
             // last resort: any div that looks like a chat bubble with substantial text
-            const divs=[...document.querySelectorAll('div[class*="message"],div[class*="bubble"],div[class*="response"]')];
-            const last=divs.filter(d=>d.innerText&&d.innerText.trim().length>20).pop();
-            return last?last.innerText.trim():'';
+            const divs=[...document.querySelectorAll('div[class*="message"],div[class*="bubble"],div[class*="response"]')]
+                .filter(d=>d.innerText&&d.innerText.trim().length>20);
+            const last=divs[divs.length-1];
+            return pack(divs.length,last?last.innerText:'');
         }
         const lastMsg=allMsgs[allMsgs.length-1];
-        return lastMsg.innerText||lastMsg.textContent||'';
+        return pack(allMsgs.length,lastMsg.innerText||lastMsg.textContent||'');
     })()"""
 
 
@@ -141,6 +146,22 @@ class MetaChat:
             self._g._abw("open", META_CHAT_URL)
             time.sleep(3)
 
+    def _get_response(self):
+        """Return (message_count, last_response_text) from the page."""
+        raw = self._g._eval(_last_response_js())
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                return 0, raw.strip()
+        if isinstance(raw, dict):
+            try:
+                n = int(raw.get("n") or 0)
+            except (TypeError, ValueError):
+                n = 0
+            return n, str(raw.get("t") or "").strip()
+        return 0, ""
+
     def ask(self, prompt: str, timeout: int = 120) -> str:
         """Submit a prompt to Meta AI chat and return the response text.
 
@@ -158,8 +179,9 @@ class MetaChat:
         if not sel:
             raise MetaError("No composer input found on meta.ai — page may not be loaded correctly")
 
-        # Capture any existing response text so we can detect new content
-        before_text = (self._g._eval(_last_response_js()) or "").strip()
+        # Snapshot message count + text so a NEW reply is detectable even when its
+        # text is identical to the previous one (same question asked twice)
+        before_n, before_text = self._get_response()
 
         # Fill the input
         fill_result = self._g._eval(_fill_input_js(json.dumps(prompt), json.dumps(sel)))
@@ -175,29 +197,28 @@ class MetaChat:
 
         # Wait for new response to appear and finish streaming
         end = time.time() + timeout
-        last_text = before_text
+        last_text = None       # last text seen SINCE a new reply appeared
         stable_count = 0
-        STABLE_NEEDED = 3  # 3 consecutive same-text polls = done
+        STABLE_NEEDED = 3      # 3 consecutive same-text non-streaming polls = done
 
         while time.time() < end:
             time.sleep(2)
-            current = (self._g._eval(_last_response_js()) or "").strip()
+            n, current = self._get_response()
             # _eval may return a bool or the strings "true"/"false" — normalize
             still_streaming = self._g._eval(_is_streaming_js()) in (True, "true")
 
-            if current and current != before_text:
-                if current == last_text and not still_streaming:
-                    stable_count += 1
-                    if stable_count >= STABLE_NEEDED:
-                        return current
-                else:
-                    stable_count = 0
-                    last_text = current
-            elif current == before_text and not still_streaming and last_text != before_text:
-                # Streaming ended, return what we have
-                return last_text or current
+            is_new = n > before_n or (bool(current) and current != before_text)
+            if not is_new:
+                continue
+            if current and current == last_text and not still_streaming:
+                stable_count += 1
+                if stable_count >= STABLE_NEEDED:
+                    return current
+            else:
+                stable_count = 0
+                last_text = current
 
-        # Timed out — return whatever we have
-        if last_text and last_text != before_text:
+        # Timed out — return whatever partial reply we saw
+        if last_text:
             return last_text
         raise MetaError(f"No response received within {timeout}s")

@@ -112,6 +112,7 @@ No token limits, no API cost — runs through your real Meta AI session (Llama 4
 | `meta_video.py` | Video gen driver (deprecated — meta.ai/vibes shut down) |
 | `launch_meta_browser.py` | Start Chrome on CDP port + inject cookies (idempotent) |
 | `save_cookies.py` | Export live cookies from running browser to `cookies.json` |
+| `test_edge_cases.py` | Offline edge-case suite (mocked browser) — `venv/Scripts/python test_edge_cases.py` |
 
 ## Gotchas
 
