@@ -53,12 +53,18 @@ def generate_image(prompt, out_path, timeout=180, g=None):
     waited = 0
     while waited < timeout:
         time.sleep(5); waited += 5
-        cur = _t39_imgs(g)
+        try:
+            cur = _t39_imgs(g)
+        except Exception:
+            continue   # transient eval/browser hiccup — keep waiting, don't abort the run
         new = [u for u in cur if u not in before]
         if new:
             # newest is first in DOM order; give it 1 more cycle to finish loading hi-res
             time.sleep(4)
-            new = [u for u in _t39_imgs(g) if u not in before]
+            try:
+                new = [u for u in _t39_imgs(g) if u not in before] or new
+            except Exception:
+                pass   # re-poll failed; fall back to the list we already have
             fresh = new[0]
             break
     if not fresh:

@@ -20,6 +20,7 @@ def main():
     with urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version") as r:
         ws_url = json.load(r)["webSocketDebuggerUrl"]
     ws = websocket.create_connection(ws_url, suppress_origin=True, max_size=None)
+    ws.settimeout(10)
     ws.send(json.dumps({"id": 1, "method": "Storage.getCookies"}))
     while True:
         resp = json.loads(ws.recv())

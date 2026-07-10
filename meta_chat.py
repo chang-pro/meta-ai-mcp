@@ -37,7 +37,11 @@ def _find_input_js():
 
 
 def _fill_input_js(prompt_json, selector_json):
-    """JS that fills the found input element (works for both textarea and contenteditable)."""
+    """JS that fills the found input element (works for both textarea and contenteditable).
+
+    contenteditable path uses execCommand('insertText') — Meta's composer is a Lexical
+    (React) editor; setting textContent directly does NOT update the editor state, but
+    insertText goes through the browser editing pipeline Lexical listens to."""
     return f"""(()=>{{
         const sel={selector_json};
         const el=document.querySelector(sel);
@@ -50,11 +54,14 @@ def _fill_input_js(prompt_json, selector_json):
             el.dispatchEvent(new Event('input',{{bubbles:true}}));
             el.dispatchEvent(new Event('change',{{bubbles:true}}));
         }} else {{
-            el.textContent={prompt_json};
-            el.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{prompt_json}}});
-            el.dispatchEvent(new Event('change',{{bubbles:true}}));
+            const range=document.createRange();
+            range.selectNodeContents(el);
+            const s=window.getSelection();
+            s.removeAllRanges();
+            s.addRange(range);
+            document.execCommand('insertText',false,{prompt_json});
         }}
-        return 'filled:'+el.value?.length+el.textContent?.length;
+        return 'filled:'+((el.value||el.textContent||'').length);
     }})()"""
 
 
@@ -175,7 +182,8 @@ class MetaChat:
         while time.time() < end:
             time.sleep(2)
             current = (self._g._eval(_last_response_js()) or "").strip()
-            still_streaming = self._g._eval(_is_streaming_js())
+            # _eval may return a bool or the strings "true"/"false" — normalize
+            still_streaming = self._g._eval(_is_streaming_js()) in (True, "true")
 
             if current and current != before_text:
                 if current == last_text and not still_streaming:
@@ -185,7 +193,7 @@ class MetaChat:
                 else:
                     stable_count = 0
                     last_text = current
-            elif current == before_text and still_streaming is False and last_text != before_text:
+            elif current == before_text and not still_streaming and last_text != before_text:
                 # Streaming ended, return what we have
                 return last_text or current
 
