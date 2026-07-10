@@ -66,10 +66,15 @@ def inject_cookies():
     if not os.path.exists(COOKIES_FILE):
         return "no cookies.json - assuming profile already logged in"
     import websocket
-    cookies = json.load(open(COOKIES_FILE))
-    with urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version") as r:
+    with open(COOKIES_FILE) as f:
+        cookies = json.load(f)
+    # Support both {name: value} dict and DevTools-export list-of-objects formats
+    if isinstance(cookies, list):
+        cookies = {c["name"]: c["value"] for c in cookies if "name" in c and "value" in c}
+    with urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version", timeout=5) as r:
         ws_url = json.load(r)["webSocketDebuggerUrl"]
     ws = websocket.create_connection(ws_url, suppress_origin=True)
+    ws.settimeout(10)
     mid = 0
     def send(method, params):
         nonlocal mid
@@ -78,6 +83,8 @@ def inject_cookies():
         while True:
             r = json.loads(ws.recv())
             if r.get("id") == mid:
+                if "error" in r:
+                    raise RuntimeError(f"CDP {method} error: {r['error']}")
                 return r
     for name, value in cookies.items():
         send("Network.setCookie", {"name": name, "value": value,

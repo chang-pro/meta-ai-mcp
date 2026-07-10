@@ -140,6 +140,7 @@ class MetaVibes:
         with urllib.request.urlopen(f"http://localhost:{self.port}/json/version", timeout=5) as r:
             ws_url = json.load(r)["webSocketDebuggerUrl"]
         ws = websocket.create_connection(ws_url, suppress_origin=True)
+        ws.settimeout(10)
         mid = 0
         def send(method, params):
             nonlocal mid
@@ -148,6 +149,8 @@ class MetaVibes:
             while True:
                 m = json.loads(ws.recv())
                 if m.get("id") == mid:
+                    if "error" in m:
+                        raise MetaError(f"CDP {method} error: {m['error']}")
                     return m
         try:
             for method, params in ops:
@@ -162,7 +165,11 @@ class MetaVibes:
             raise MetaError("no alternate Meta account to rotate to — add cookie JSON files under accounts/")
         self.acct_idx = (self.acct_idx + 1) % len(self.accounts)
         path = self.accounts[self.acct_idx]
-        cookies = json.load(open(path))
+        with open(path) as f:
+            cookies = json.load(f)
+        # Support both {name: value} dict and DevTools-export list-of-objects formats
+        if isinstance(cookies, list):
+            cookies = {c["name"]: c["value"] for c in cookies if "name" in c and "value" in c}
         ops = [("Network.clearBrowserCookies", {})]
         for name, value in cookies.items():
             ops.append(("Network.setCookie", {"name": name, "value": value, "domain": ".meta.ai", "path": "/"}))
@@ -308,15 +315,15 @@ class MetaVibes:
                     if c > 0:
                         self.new_chat()        # current chat stalled -> next chat, same account
                     return self._generate_once(prompt, image_path, out_path, timeout)
-                except MetaError as e:
-                    last_err = e
+                except (MetaError, Exception) as e:
+                    last_err = MetaError(str(e)) if not isinstance(e, MetaError) else e
             # every chat on this account stalled -> rotate to the next account (if any) and retry
             if rotate_accounts and a < accounts_to_try - 1 and len(self.accounts) > 1:
                 try:
                     who = self.rotate_account()
                     last_err = MetaError(f"rotated to account {who} after stalls; {last_err}")
-                except MetaError as e:
-                    last_err = e
+                except Exception as e:
+                    last_err = MetaError(str(e))
                     break
         return {"success": False, "error": f"MetaError: {last_err}"}
 

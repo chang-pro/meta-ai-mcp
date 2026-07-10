@@ -67,7 +67,8 @@ def generate_image(prompt, out_path, timeout=180, g=None):
     if not data or len(data) < 20000:
         return None
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    open(out_path, "wb").write(data)
+    with open(out_path, "wb") as f:
+        f.write(data)
     return out_path
 
 
